@@ -10,10 +10,16 @@ __pycache__/
 *$py.class
 *.so
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage*
+coverage/
 
 # Django / Database
 db.sqlite3
 db.sqlite3-journal
+*.sqlite3
+*.sqlite3-*
 *.log
 
 # Frontend / Node

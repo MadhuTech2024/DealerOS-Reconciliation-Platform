@@ -17,6 +17,10 @@ Including another URLconf
 from django.contrib import admin
 from django.urls import path
 
+from reconcile import views as reconcile_views
+
 urlpatterns = [
     path('admin/', admin.site.urls),
+    path('api/disagreements/', reconcile_views.disagreements, name='disagreements'),
+    path('api/summary/', reconcile_views.summary, name='reconciliation-summary'),
 ]

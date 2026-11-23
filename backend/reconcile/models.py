@@ -46,6 +46,27 @@ class Location(models.Model):
         return f"{self.location_id} ({self.organization.org_id})"
 
 
+class ImportIssue(models.Model):
+    """Preserves source rows that cannot be represented by the domain models."""
+    source_file = models.CharField(max_length=64)
+    source_row_number = models.PositiveIntegerField()
+    raw_data = models.JSONField(default=dict, blank=True)
+    message = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["source_file", "source_row_number"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["source_file", "source_row_number"],
+                name="unique_import_issue_source_row",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.source_file} (row {self.source_row_number}): {self.message}"
+
+
 class SystemARecord(models.Model):
     """
     Represents an operational transaction record from System A (system_a.csv).

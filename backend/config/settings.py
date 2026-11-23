@@ -10,7 +10,10 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/5.2/ref/settings/
 """
 
+import os
 from pathlib import Path
+
+from django.core.exceptions import ImproperlyConfigured
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -19,13 +22,38 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/5.2/howto/deployment/checklist/
 
-# SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-swfdcb#fz-@ysvhflgy19=n5zu*02*+n%&-c=gmf$l=2z=fhm5'
+DJANGO_ENV = os.environ.get("DJANGO_ENV", "development").strip().lower()
+if DJANGO_ENV not in {"development", "production"}:
+    raise ImproperlyConfigured("DJANGO_ENV must be 'development' or 'production'.")
 
-# SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+debug_setting = os.environ.get("DJANGO_DEBUG")
+if debug_setting is None:
+    DEBUG = False
+elif debug_setting.strip().lower() in {"1", "true", "yes"}:
+    DEBUG = True
+elif debug_setting.strip().lower() in {"0", "false", "no"}:
+    DEBUG = False
+else:
+    raise ImproperlyConfigured("DJANGO_DEBUG must be a boolean value.")
 
-ALLOWED_HOSTS = []
+if DJANGO_ENV == "production" and DEBUG:
+    raise ImproperlyConfigured("DJANGO_DEBUG must be false when DJANGO_ENV is production.")
+
+SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY", "").strip()
+if not SECRET_KEY:
+    if DJANGO_ENV == "production":
+        raise ImproperlyConfigured("DJANGO_SECRET_KEY is required in production.")
+    SECRET_KEY = "assessment-local-development-key-not-for-production"
+elif DJANGO_ENV == "production" and len(SECRET_KEY) < 50:
+    raise ImproperlyConfigured(
+        "DJANGO_SECRET_KEY must contain at least 50 characters in production."
+    )
+
+ALLOWED_HOSTS = [
+    host.strip()
+    for host in os.environ.get("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1").split(",")
+    if host.strip()
+]
 
 
 # Application definition

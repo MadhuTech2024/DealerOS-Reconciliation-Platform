@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 from django.core.management import call_command
 from django.core.management.base import CommandError
-from reconcile.models import Organization, Location, SystemARecord, SystemBEntry
+from reconcile.models import ImportIssue, Organization, Location, SystemARecord, SystemBEntry
 from reconcile.management.commands.import_csv_data import parse_decimal_safe, parse_date_safe
 
 
@@ -53,6 +53,16 @@ def test_parse_decimal_safe_invalid():
     assert is_blank is False
     assert "Invalid monetary format" in warn
 
+    val, is_blank, warn = parse_decimal_safe("NaN")
+    assert val is None
+    assert is_blank is False
+    assert "Invalid monetary format" in warn
+
+    val, is_blank, warn = parse_decimal_safe("1000000000000.00")
+    assert val is None
+    assert is_blank is False
+    assert "exceeds supported precision" in warn
+
 
 # Integration tests for CSV importer
 @pytest.mark.django_db
@@ -82,6 +92,7 @@ def test_import_actual_csv_files():
     # 2. System A and B row counts
     assert SystemARecord.objects.count() == 120
     assert SystemBEntry.objects.count() == 121
+    assert ImportIssue.objects.count() == 0
 
 
 @pytest.mark.django_db
@@ -208,23 +219,230 @@ def test_invalid_values_do_not_drop_row(tmp_path):
 
 
 @pytest.mark.django_db
+def test_missing_csv_cells_are_preserved_without_crashing(tmp_path):
+    loc_file = tmp_path / "locations.csv"
+    loc_file.write_text(
+        "location_id,org_id,location_name\nLOC-EDGE,ORG-EDGE,Edge Location\n",
+        encoding="utf-8",
+    )
+    sys_a_file = tmp_path / "system_a.csv"
+    sys_a_file.write_text(
+        "record_id,location_id,event_date,category_code,actor_id,base_value,adjustment,total_value,state\n"
+        "REC-EDGE,LOC-EDGE\n",
+        encoding="utf-8",
+    )
+    sys_b_file = tmp_path / "system_b.csv"
+    sys_b_file.write_text(
+        "entry_id,record_ref,location_id,recorded_on,value,label\nENT-EDGE\n",
+        encoding="utf-8",
+    )
+
+    call_command(
+        "import_csv_data",
+        replace=True,
+        locations_file=str(loc_file),
+        system_a_file=str(sys_a_file),
+        system_b_file=str(sys_b_file),
+    )
+
+    record = SystemARecord.objects.get(record_id="REC-EDGE")
+    assert record.actor_id is None
+    assert record.total_value is None
+    assert record.raw_data["total_value"] is None
+
+    entry = SystemBEntry.objects.get(entry_id="ENT-EDGE")
+    assert entry.record_ref == ""
+    assert entry.value is None
+    assert entry.is_value_blank is True
+    assert entry.raw_data["record_ref"] is None
+
+
+@pytest.mark.django_db
+def test_invalid_and_duplicate_location_rows_are_retained(tmp_path):
+    loc_file = tmp_path / "locations.csv"
+    loc_file.write_text(
+        "location_id,org_id,location_name\n"
+        "LOC-EDGE,ORG-EDGE,Original Location\n"
+        "LOC-EDGE,ORG-OTHER,Duplicate Location ID\n"
+        "LOC-MISSING-ORG,,No Owner\n"
+        ",ORG-EDGE,No Location ID\n",
+        encoding="utf-8",
+    )
+    sys_a_file = tmp_path / "system_a.csv"
+    sys_a_file.write_text(
+        "record_id,location_id,event_date,category_code,actor_id,base_value,adjustment,total_value,state\n",
+        encoding="utf-8",
+    )
+    sys_b_file = tmp_path / "system_b.csv"
+    sys_b_file.write_text(
+        "entry_id,record_ref,location_id,recorded_on,value,label\n",
+        encoding="utf-8",
+    )
+
+    import_options = {
+        "replace": True,
+        "locations_file": str(loc_file),
+        "system_a_file": str(sys_a_file),
+        "system_b_file": str(sys_b_file),
+    }
+    call_command("import_csv_data", **import_options)
+    call_command("import_csv_data", **import_options)
+
+    assert Location.objects.count() == 1
+    assert Location.objects.get(location_id="LOC-EDGE").organization_id == "ORG-EDGE"
+    assert ImportIssue.objects.count() == 3
+    assert set(ImportIssue.objects.values_list("source_row_number", flat=True)) == {3, 4, 5}
+    duplicate = ImportIssue.objects.get(source_row_number=3)
+    assert duplicate.raw_data["org_id"] == "ORG-OTHER"
+    assert "duplicate location_id" in duplicate.message
+
+
+@pytest.mark.django_db
+def test_short_location_row_is_recorded_and_following_valid_row_imports(tmp_path):
+    existing_org = Organization.objects.create(org_id="ORG-SHORT", name="Existing organization")
+    Location.objects.create(
+        location_id="LOC-SHORT",
+        organization=existing_org,
+        location_name="Existing location name",
+    )
+    loc_file = tmp_path / "locations.csv"
+    loc_file.write_text(
+        "location_id,org_id,location_name\n"
+        "LOC-SHORT,ORG-SHORT\n"
+        "LOC-AFTER,ORG-AFTER,Valid Following Location\n",
+        encoding="utf-8",
+    )
+    sys_a_file = tmp_path / "system_a.csv"
+    sys_a_file.write_text(
+        "record_id,location_id,event_date,category_code,actor_id,base_value,adjustment,total_value,state\n",
+        encoding="utf-8",
+    )
+    sys_b_file = tmp_path / "system_b.csv"
+    sys_b_file.write_text(
+        "entry_id,record_ref,location_id,recorded_on,value,label\n",
+        encoding="utf-8",
+    )
+
+    call_command(
+        "import_csv_data",
+        replace=True,
+        locations_file=str(loc_file),
+        system_a_file=str(sys_a_file),
+        system_b_file=str(sys_b_file),
+    )
+
+    assert Location.objects.get(location_id="LOC-SHORT").location_name == "Existing location name"
+    following = Location.objects.get(location_id="LOC-AFTER")
+    assert following.organization_id == "ORG-AFTER"
+    assert following.location_name == "Valid Following Location"
+    issue = ImportIssue.objects.get(source_row_number=2)
+    assert issue.raw_data["location_name"] is None
+    assert "missing CSV cell(s): location_name" in issue.message
+
+
+@pytest.mark.django_db
+def test_replace_preserves_independently_sourced_records_linked_to_locations():
+    call_command("import_csv_data", replace=True)
+    location = Location.objects.get(location_id="LOC-101")
+    external_a = SystemARecord.objects.create(
+        source_file="external_a.csv",
+        source_row_number=2,
+        record_id="EXTERNAL-A",
+        raw_location_id=location.location_id,
+        location=location,
+    )
+    external_b = SystemBEntry.objects.create(
+        source_file="external_b.csv",
+        source_row_number=2,
+        entry_id="EXTERNAL-B",
+        record_ref="REC-EXTERNAL",
+        raw_location_id=location.location_id,
+        location=location,
+    )
+
+    call_command("import_csv_data", replace=True)
+
+    external_a.refresh_from_db()
+    external_b.refresh_from_db()
+    assert external_a.location_id == location.location_id
+    assert external_b.location_id == location.location_id
+    assert external_a.location.organization_id == "ORG-A"
+    assert external_b.location.organization_id == "ORG-A"
+    assert SystemARecord.objects.filter(source_file="system_a.csv").count() == 120
+    assert SystemBEntry.objects.filter(source_file="system_b.csv").count() == 121
+    assert SystemARecord.objects.filter(source_file="external_a.csv").count() == 1
+    assert SystemBEntry.objects.filter(source_file="external_b.csv").count() == 1
+
+
+@pytest.mark.django_db
 def test_transaction_rollback_on_failure(tmp_path, monkeypatch):
     """Verify that an unhandled error inside import transaction rolls back all changes."""
-    # First, import real data
     call_command("import_csv_data", replace=True)
-    assert SystemARecord.objects.count() == 120
+    Organization.objects.filter(org_id="ORG-A").update(name="Pre-import organization name")
+    Location.objects.filter(location_id="LOC-101").update(location_name="Pre-import location name")
+    preserved_org = Organization.objects.create(org_id="ORG-PRESERVED", name="Preserved organization")
+    preserved_location = Location.objects.create(
+        location_id="LOC-PRESERVED",
+        organization=preserved_org,
+        location_name="Preserved location",
+    )
+    SystemARecord.objects.create(
+        source_file="independent_a.csv",
+        source_row_number=2,
+        record_id="INDEPENDENT-A",
+        location=preserved_location,
+        raw_location_id=preserved_location.location_id,
+    )
+    SystemBEntry.objects.create(
+        source_file="independent_b.csv",
+        source_row_number=2,
+        entry_id="INDEPENDENT-B",
+        record_ref="REC-INDEPENDENT",
+        location=preserved_location,
+        raw_location_id=preserved_location.location_id,
+    )
 
-    # Simulate an error during System B import
-    def fail_create(*args, **kwargs):
-        raise RuntimeError("Simulated Database Failure")
+    before_a = list(SystemARecord.objects.order_by("pk").values_list(
+        "pk", "source_file", "source_row_number", "record_id", "location_id", "total_value", "raw_data"
+    ))
+    before_b = list(SystemBEntry.objects.order_by("pk").values_list(
+        "pk", "source_file", "source_row_number", "entry_id", "record_ref", "location_id", "value", "raw_data"
+    ))
+    before_locations = list(Location.objects.order_by("pk").values_list(
+        "location_id", "organization_id", "location_name", "raw_data"
+    ))
+    before_organizations = list(Organization.objects.order_by("pk").values_list(
+        "org_id", "name"
+    ))
 
-    monkeypatch.setattr(SystemBEntry.objects, "create", fail_create)
+    original_create = SystemBEntry.objects.create
+    create_count = 0
+
+    def fail_after_one_entry(*args, **kwargs):
+        nonlocal create_count
+        create_count += 1
+        if create_count == 2:
+            raise RuntimeError("Simulated Database Failure")
+        return original_create(*args, **kwargs)
+
+    monkeypatch.setattr(SystemBEntry.objects, "create", fail_after_one_entry)
 
     with pytest.raises(RuntimeError, match="Simulated Database Failure"):
         call_command("import_csv_data", replace=True)
 
-    # Because replace=True started an atomic transaction, the rollback prevents partial state
-    # Either previous data is restored or nothing is committed
+    assert create_count == 2
+    assert list(SystemARecord.objects.order_by("pk").values_list(
+        "pk", "source_file", "source_row_number", "record_id", "location_id", "total_value", "raw_data"
+    )) == before_a
+    assert list(SystemBEntry.objects.order_by("pk").values_list(
+        "pk", "source_file", "source_row_number", "entry_id", "record_ref", "location_id", "value", "raw_data"
+    )) == before_b
+    assert list(Location.objects.order_by("pk").values_list(
+        "location_id", "organization_id", "location_name", "raw_data"
+    )) == before_locations
+    assert list(Organization.objects.order_by("pk").values_list(
+        "org_id", "name"
+    )) == before_organizations
 
 
 @pytest.mark.django_db
